@@ -1,3 +1,6 @@
+from typing import List, Optional
+
+import torch
 import torch.nn as nn
 
 
@@ -46,9 +49,12 @@ class ResidualConvUnit(nn.Module):
         
         self.conv2 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1, bias=True, groups=self.groups)
 
-        if self.bn == True:
+        if self.bn:
             self.bn1 = nn.BatchNorm2d(features)
             self.bn2 = nn.BatchNorm2d(features)
+        else:
+            self.bn1 = nn.Identity()
+            self.bn2 = nn.Identity()
 
         self.activation = activation
 
@@ -66,16 +72,11 @@ class ResidualConvUnit(nn.Module):
         
         out = self.activation(x)
         out = self.conv1(out)
-        if self.bn == True:
-            out = self.bn1(out)
+        out = self.bn1(out)
        
         out = self.activation(out)
         out = self.conv2(out)
-        if self.bn == True:
-            out = self.bn2(out)
-
-        if self.groups > 1:
-            out = self.conv_merge(out)
+        out = self.bn2(out)
 
         return self.skip_add.add(out, x)
 
@@ -120,7 +121,7 @@ class FeatureFusionBlock(nn.Module):
 
         self.size=size
 
-    def forward(self, *xs, size=None):
+    def forward(self, xs: List[torch.Tensor], size: Optional[List[int]]=None):
         """Forward pass.
 
         Returns:
@@ -134,14 +135,12 @@ class FeatureFusionBlock(nn.Module):
 
         output = self.resConfUnit2(output)
 
-        if (size is None) and (self.size is None):
-            modifier = {"scale_factor": 2}
-        elif size is None:
-            modifier = {"size": self.size}
+        if size is not None:
+            output = nn.functional.interpolate(output, size=size, mode="bilinear", align_corners=self.align_corners)
+        elif self.size is None:
+            output = nn.functional.interpolate(output, scale_factor=2., mode="bilinear", align_corners=self.align_corners)
         else:
-            modifier = {"size": size}
-
-        output = nn.functional.interpolate(output, **modifier, mode="bilinear", align_corners=self.align_corners)
+            output = nn.functional.interpolate(output, size=self.size, mode="bilinear", align_corners=self.align_corners)
         
         output = self.out_conv(output)
 

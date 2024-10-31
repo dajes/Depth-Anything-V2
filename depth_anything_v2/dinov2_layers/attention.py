@@ -10,6 +10,7 @@
 
 import logging
 
+import torch
 from torch import Tensor
 from torch import nn
 
@@ -42,21 +43,25 @@ class Attention(nn.Module):
         self.scale = head_dim**-0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
 
     def forward(self, x: Tensor) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
-        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
-        attn = q @ k.transpose(-2, -1)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        if self.flash:
+            x = torch.nn.functional.scaled_dot_product_attention(q, k, v).transpose(1, 2)
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1).type_as(x)
+            x = (attn @ v).transpose(1, 2)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = x.reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

@@ -10,15 +10,16 @@
 from functools import partial
 import math
 import logging
-from typing import Sequence, Tuple, Union, Callable
+from typing import Sequence, Tuple, Union, Callable, List
 
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
 from torch.nn.init import trunc_normal_
 
-from .dinov2_layers import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
-
+from .dinov2_layers import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention
+from .dinov2_layers.attention import Attention
+from .dinov2_layers.block import Block
 
 logger = logging.getLogger("dinov2")
 
@@ -176,7 +177,7 @@ class DinoVisionTransformer(nn.Module):
             nn.init.normal_(self.register_tokens, std=1e-6)
         named_apply(init_weights_vit_timm, self)
 
-    def interpolate_pos_encoding(self, x, w, h):
+    def interpolate_pos_encoding(self, x, w: int, h: int):
         previous_dtype = x.dtype
         npatch = x.shape[1] - 1
         N = self.pos_embed.shape[1] - 1
@@ -209,12 +210,9 @@ class DinoVisionTransformer(nn.Module):
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
 
-    def prepare_tokens_with_masks(self, x, masks=None):
+    def prepare_tokens_with_masks(self, x):
         B, nc, w, h = x.shape
         x = self.patch_embed(x)
-        if masks is not None:
-            x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
-
         x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = x + self.interpolate_pos_encoding(x, w, h)
 
@@ -230,31 +228,11 @@ class DinoVisionTransformer(nn.Module):
 
         return x
 
-    def forward_features_list(self, x_list, masks_list):
-        x = [self.prepare_tokens_with_masks(x, masks) for x, masks in zip(x_list, masks_list)]
-        for blk in self.blocks:
-            x = blk(x)
-
-        all_x = x
-        output = []
-        for x, masks in zip(all_x, masks_list):
-            x_norm = self.norm(x)
-            output.append(
-                {
-                    "x_norm_clstoken": x_norm[:, 0],
-                    "x_norm_regtokens": x_norm[:, 1 : self.num_register_tokens + 1],
-                    "x_norm_patchtokens": x_norm[:, self.num_register_tokens + 1 :],
-                    "x_prenorm": x,
-                    "masks": masks,
-                }
-            )
-        return output
-
-    def forward_features(self, x, masks=None):
+    def forward_features(self, x):
         if isinstance(x, list):
-            return self.forward_features_list(x, masks)
+            return self.forward_features_list(x)
 
-        x = self.prepare_tokens_with_masks(x, masks)
+        x = self.prepare_tokens_with_masks(x)
 
         for blk in self.blocks:
             x = blk(x)
@@ -265,14 +243,13 @@ class DinoVisionTransformer(nn.Module):
             "x_norm_regtokens": x_norm[:, 1 : self.num_register_tokens + 1],
             "x_norm_patchtokens": x_norm[:, self.num_register_tokens + 1 :],
             "x_prenorm": x,
-            "masks": masks,
         }
 
-    def _get_intermediate_layers_not_chunked(self, x, n=1):
+    def _get_intermediate_layers_not_chunked(self, x, n: List[int]):
         x = self.prepare_tokens_with_masks(x)
         # If n is an int, take the n last blocks. If it's a list, take them
         output, total_block_len = [], len(self.blocks)
-        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        blocks_to_take = n
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if i in blocks_to_take:
@@ -280,52 +257,23 @@ class DinoVisionTransformer(nn.Module):
         assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
         return output
 
-    def _get_intermediate_layers_chunked(self, x, n=1):
-        x = self.prepare_tokens_with_masks(x)
-        output, i, total_block_len = [], 0, len(self.blocks[-1])
-        # If n is an int, take the n last blocks. If it's a list, take them
-        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
-        for block_chunk in self.blocks:
-            for blk in block_chunk[i:]:  # Passing the nn.Identity()
-                x = blk(x)
-                if i in blocks_to_take:
-                    output.append(x)
-                i += 1
-        assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
-        return output
-
     def get_intermediate_layers(
         self,
         x: torch.Tensor,
-        n: Union[int, Sequence] = 1,  # Layers or n last layers to take
-        reshape: bool = False,
-        return_class_token: bool = False,
-        norm=True
-    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
-        if self.chunked_blocks:
-            outputs = self._get_intermediate_layers_chunked(x, n)
-        else:
-            outputs = self._get_intermediate_layers_not_chunked(x, n)
+        n: List[int],  # Layers or n last layers to take
+        norm: bool =True
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        outputs = self._get_intermediate_layers_not_chunked(x, n)
         if norm:
             outputs = [self.norm(out) for out in outputs]
         class_tokens = [out[:, 0] for out in outputs]
         outputs = [out[:, 1 + self.num_register_tokens:] for out in outputs]
-        if reshape:
-            B, _, w, h = x.shape
-            outputs = [
-                out.reshape(B, w // self.patch_size, h // self.patch_size, -1).permute(0, 3, 1, 2).contiguous()
-                for out in outputs
-            ]
-        if return_class_token:
-            return tuple(zip(outputs, class_tokens))
-        return tuple(outputs)
-
-    def forward(self, *args, is_training=False, **kwargs):
-        ret = self.forward_features(*args, **kwargs)
-        if is_training:
-            return ret
-        else:
-            return self.head(ret["x_norm_clstoken"])
+        return (
+            (outputs[0], class_tokens[0]),
+            (outputs[1], class_tokens[1]),
+            (outputs[2], class_tokens[2]),
+            (outputs[3], class_tokens[3]),
+        )
 
 
 def init_weights_vit_timm(module: nn.Module, name: str = ""):
@@ -343,7 +291,7 @@ def vit_small(patch_size=16, num_register_tokens=0, **kwargs):
         depth=12,
         num_heads=6,
         mlp_ratio=4,
-        block_fn=partial(Block, attn_class=MemEffAttention),
+        block_fn=partial(Block, attn_class=Attention),
         num_register_tokens=num_register_tokens,
         **kwargs,
     )
@@ -357,7 +305,7 @@ def vit_base(patch_size=16, num_register_tokens=0, **kwargs):
         depth=12,
         num_heads=12,
         mlp_ratio=4,
-        block_fn=partial(Block, attn_class=MemEffAttention),
+        block_fn=partial(Block, attn_class=Attention),
         num_register_tokens=num_register_tokens,
         **kwargs,
     )
@@ -371,7 +319,7 @@ def vit_large(patch_size=16, num_register_tokens=0, **kwargs):
         depth=24,
         num_heads=16,
         mlp_ratio=4,
-        block_fn=partial(Block, attn_class=MemEffAttention),
+        block_fn=partial(Block, attn_class=Attention),
         num_register_tokens=num_register_tokens,
         **kwargs,
     )
@@ -388,7 +336,7 @@ def vit_giant2(patch_size=16, num_register_tokens=0, **kwargs):
         depth=40,
         num_heads=24,
         mlp_ratio=4,
-        block_fn=partial(Block, attn_class=MemEffAttention),
+        block_fn=partial(Block, attn_class=Attention),
         num_register_tokens=num_register_tokens,
         **kwargs,
     )
