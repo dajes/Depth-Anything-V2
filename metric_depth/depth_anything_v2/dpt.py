@@ -115,11 +115,11 @@ class DPTHead(nn.Module):
             nn.Sigmoid()
         )
     
-    def forward(self, out_features: Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]], patch_h: int, patch_w: int):
-        layer_1 = self.resize_layers[0](self.projects[0](out_features[0][0].permute(0, 2, 1).reshape((out_features[0][0].shape[0], out_features[0][0].shape[-1], patch_h, patch_w))))
-        layer_2 = self.resize_layers[1](self.projects[1](out_features[1][0].permute(0, 2, 1).reshape((out_features[1][0].shape[0], out_features[1][0].shape[-1], patch_h, patch_w))))
-        layer_3 = self.resize_layers[2](self.projects[2](out_features[2][0].permute(0, 2, 1).reshape((out_features[2][0].shape[0], out_features[2][0].shape[-1], patch_h, patch_w))))
-        layer_4 = self.resize_layers[3](self.projects[3](out_features[3][0].permute(0, 2, 1).reshape((out_features[3][0].shape[0], out_features[3][0].shape[-1], patch_h, patch_w))))
+    def forward(self, out_features, patch_h: int, patch_w: int):
+        layer_1 = self.resize_layers[0](self.projects[0](out_features[0, :, 1:].permute(0, 2, 1).reshape((out_features[0, :, 1:].shape[0], out_features[0, :, 1:].shape[-1], patch_h, patch_w))))
+        layer_2 = self.resize_layers[1](self.projects[1](out_features[1, :, 1:].permute(0, 2, 1).reshape((out_features[1, :, 1:].shape[0], out_features[1, :, 1:].shape[-1], patch_h, patch_w))))
+        layer_3 = self.resize_layers[2](self.projects[2](out_features[2, :, 1:].permute(0, 2, 1).reshape((out_features[2, :, 1:].shape[0], out_features[2, :, 1:].shape[-1], patch_h, patch_w))))
+        layer_4 = self.resize_layers[3](self.projects[3](out_features[3, :, 1:].permute(0, 2, 1).reshape((out_features[3, :, 1:].shape[0], out_features[3, :, 1:].shape[-1], patch_h, patch_w))))
         
         layer_1_rn = self.scratch.layer1_rn(layer_1)
         layer_2_rn = self.scratch.layer2_rn(layer_2)
@@ -171,7 +171,7 @@ class DepthAnythingV2(nn.Module):
         
         depth = self.depth_head(features, patch_h, patch_w) * self.max_depth
         
-        return depth.squeeze(1)
+        return depth[:, 0]
     
     @torch.no_grad()
     def infer_image(self, raw_image, input_size=518):

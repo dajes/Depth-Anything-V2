@@ -136,9 +136,9 @@ class FeatureFusionBlock(nn.Module):
         output = self.resConfUnit2(output)
 
         if size is not None:
-            output = nn.functional.interpolate(output, size=size, mode="bilinear", align_corners=self.align_corners)
+            output = nn.functional.interpolate(output, size=(size[0], size[1]), mode="bilinear", align_corners=self.align_corners)
         elif self.size is None:
-            output = nn.functional.interpolate(output, scale_factor=2., mode="bilinear", align_corners=self.align_corners)
+            output = nn.functional.interpolate(output, size=(output.shape[2] * 2, output.shape[3] * 2), mode="bilinear", align_corners=self.align_corners)
         else:
             output = nn.functional.interpolate(output, size=self.size, mode="bilinear", align_corners=self.align_corners)
         

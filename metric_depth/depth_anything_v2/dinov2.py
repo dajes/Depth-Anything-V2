@@ -181,32 +181,30 @@ class DinoVisionTransformer(nn.Module):
         previous_dtype = x.dtype
         npatch = x.shape[1] - 1
         N = self.pos_embed.shape[1] - 1
+        w0 = w // self.patch_size
+        h0 = h // self.patch_size
+        sqrt_N = min(w0, h0)
         if npatch == N and w == h:
             return self.pos_embed
         pos_embed = self.pos_embed.float()
         class_pos_embed = pos_embed[:, 0]
         patch_pos_embed = pos_embed[:, 1:]
-        dim = x.shape[-1]
-        w0 = w // self.patch_size
-        h0 = h // self.patch_size
+        dim = int(x.shape[-1])
         # we add a small number to avoid floating point error in the interpolation
         # see discussion at https://github.com/facebookresearch/dino/issues/8
         # DINOv2 with register modify the interpolate_offset from 0.1 to 0.0
         w0, h0 = w0 + self.interpolate_offset, h0 + self.interpolate_offset
         # w0, h0 = w0 + 0.1, h0 + 0.1
-        
-        sqrt_N = math.sqrt(N)
-        sx, sy = float(w0) / sqrt_N, float(h0) / sqrt_N
+
+        out = patch_pos_embed.reshape(1, sqrt_N, sqrt_N, dim)
+
         patch_pos_embed = nn.functional.interpolate(
-            patch_pos_embed.reshape(1, int(sqrt_N), int(sqrt_N), dim).permute(0, 3, 1, 2),
-            scale_factor=(sx, sy),
-            # (int(w0), int(h0)), # to solve the upsampling shape issue
+            out.permute(0, 3, 1, 2),
+            (int(w0), int(h0)),
             mode="bicubic",
             antialias=self.interpolate_antialias
         )
-        
-        assert int(w0) == patch_pos_embed.shape[-2]
-        assert int(h0) == patch_pos_embed.shape[-1]
+
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
 
@@ -245,35 +243,27 @@ class DinoVisionTransformer(nn.Module):
             "x_prenorm": x,
         }
 
-    def _get_intermediate_layers_not_chunked(self, x, n: List[int]):
+    def _get_intermediate_layers_not_chunked(self, x, blocks_to_take: List[int]):
         x = self.prepare_tokens_with_masks(x)
         # If n is an int, take the n last blocks. If it's a list, take them
-        output, total_block_len = [], len(self.blocks)
-        blocks_to_take = n
+        output = []
+
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if i in blocks_to_take:
                 output.append(x)
-        assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
-        return output
+        return torch.stack(output, dim=0)
 
     def get_intermediate_layers(
         self,
         x: torch.Tensor,
         n: List[int],  # Layers or n last layers to take
         norm: bool =True
-    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    ):
         outputs = self._get_intermediate_layers_not_chunked(x, n)
         if norm:
-            outputs = [self.norm(out) for out in outputs]
-        class_tokens = [out[:, 0] for out in outputs]
-        outputs = [out[:, 1 + self.num_register_tokens:] for out in outputs]
-        return (
-            (outputs[0], class_tokens[0]),
-            (outputs[1], class_tokens[1]),
-            (outputs[2], class_tokens[2]),
-            (outputs[3], class_tokens[3]),
-        )
+            outputs = self.norm(outputs)
+        return outputs
 
 
 def init_weights_vit_timm(module: nn.Module, name: str = ""):
